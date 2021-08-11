@@ -1,0 +1,150 @@
+---
+title: "Practical Machine Learning"
+output: html_document
+---
+
+## Introduction
+
+This write-up describes an analysis of the Weight Lifting Exercise Dataset using a machine learning classifier. Taking data from accelerometers on the belt, forearm, arm and dumbbell of 6 participants, a random forest algorithm was able to classify the type of barbell lift performed with an estimated \>99% out-of-sample accuracy.
+
+## Data Preparation
+
+The libraries required are loaded in.
+
+```{r message = FALSE}
+library(lattice)
+library(ggplot2)
+library(caret)
+library(randomForest)
+library(rpart)
+library(gbm)
+library(plyr)
+```
+
+First we load in the training data and set the seed. We partition it into main (80%) and reserve (20%) data. By doing so, we can do the bulk of the training on main using cross-validation, then estimate the out-of-sample error on reserve.
+
+```{r}
+#read in training data
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+set.seed(1000)
+inTrain <- createDataPartition(training$classe, p = 0.8)[[1]]
+trainingReserve <- training[-inTrain, ]
+trainingMain <- training[inTrain, ]
+```
+
+Let's take a look at the data:
+
+```{r}
+str(trainingMain)
+```
+
+As we can see, there are several variables that would not be useful for prediction, from X to num_window. There are also some columns that consist of largely NA values or empty character strings. We remove these groups below. The final number of features is 52, excluding the outcome variable *classe*.
+
+```{r}
+trainingSub1 <- trainingMain[,-c(1,2,3,4,5,6,7)]
+rem <- c()
+for (i in (1:dim(trainingSub1)[2])) {
+  if (class(trainingSub1[[i]]) == "character") {
+    rem <- append(rem, i)
+  }
+}
+
+trainingSub2 <- trainingSub1[, -rem]
+
+rem <- c()
+for (i in (1:dim(trainingSub2)[2])) {
+  empty <- sum(is.na(trainingSub2[[i]]))
+  total <- length(trainingSub2[[i]])
+  if ((empty / total) > 0.90) rem <- append(rem, i)
+}
+
+trainingSub3 <- trainingSub2[, -rem]
+trainingFinal <- cbind(trainingSub3, classe = factor(trainingMain$classe))
+trainingReserve <- trainingReserve[, names(trainingFinal)]
+rm(list = "trainingSub1", "trainingSub2", "trainingSub3", "empty", "i", "rem", "total")
+```
+
+We see that the classes are mostly equally distributed, hence we can stick with Accuracy as our main metric for the model performance.
+
+```{r}
+table(trainingMain$classe)
+```
+
+## Model Selection
+
+We start off by running the data through a random forest to get a general understanding of the base level of accuracy. Through 10-fold cross validation, we estimate a out-of-sample error rate of around 99%, which is very good.
+
+```{r cache = TRUE}
+trainControlCV <- trainControl(method = "cv", number = 10)
+rfBase <- train(classe ~., data = trainingFinal, method = "rf", trControl = trainControlCV)
+rfBase$results
+```
+
+We repeat this process using other machine learning models.
+
+```{r cache = TRUE}
+gbmBase <- train(classe ~., data = trainingFinal, method = "gbm", trControl = trainControlCV, verbose = FALSE)
+gbmBase$results
+ldaBase <- train(classe ~., data = trainingFinal, method = "lda", trControl = trainControlCV, preProcess = c("center", "scale"))
+ldaBase$results
+svmBase <- train(classe ~., data = trainingFinal, method = "svmLinear", trControl = trainControlCV)
+svmBase$results
+```
+
+Because other models give an accuracy much lower than the random forest, ensembling was decided against and random forests were focused on instead.
+
+Considering the large number of features, feature extraction using Principal Component Analysis was attempted, followed by plotting of the variance explained graph.
+
+```{r cache = TRUE}
+pca <- prcomp(trainingFinal[, -53], scale. = TRUE)
+var <- pca$sdev ^ 2
+varExp <- var / sum(var)
+plot(varExp)
+```
+
+However, as we can see, the varExp is relatively distributed out across the principal components, with 25 principal components needed to explain 95% of the variance. If we attempt to train a random forest after PCA, the accuracy is worse:
+
+```{r cache = TRUE}
+trainingPCA <- cbind(as.data.frame(pca$x[, 1:25]), classe = trainingFinal$classe)
+rfPCA <- train(classe ~., data = trainingPCA, method = "rf", trControl = trainControlCV)
+rfPCA$results
+```
+
+Besides PCA, we can conduct feature selection using the varImp function on our random forest models successively. With accuracy as the metric, the total number of predictors selected was 30. As we are using random forests, it is not necessary to continue with numeric transformations of the data. We calculate the final model rfFinal using mtry = 2, number of predictors = 25, with no pre-processing.
+
+```{r cache = TRUE}
+decreaseFeatures <- function(number, model) {
+  varImpDF <- varImp(model)$importance
+  varImpVector <- varImpDF[[1]]
+  names(varImpVector) <- row.names(varImpDF)
+  varImpVectorSorted <- sort(varImpVector, decreasing = TRUE)
+  names <- names(varImpVectorSorted)[1:number]
+  subset <- cbind(trainingFinal[, names], classe = trainingFinal$classe)
+  newModel <- train(classe ~., data = subset, method = "rf", trControl = trainControlCV, tuneGrid = expand.grid(mtry = c(2)))
+  newModel
+}
+rf0 <- decreaseFeatures(30, rfBase)
+rf0$results
+rf1 <- decreaseFeatures(25, rfBase)
+rf1$results
+rf2 <- decreaseFeatures(20, rfBase)
+rf2$results
+
+namesFinal <- c(rf1$coefnames, "classe")
+rfFinal <- train(classe ~., data = trainingFinal[, namesFinal], method = "rf",
+                 trControl = trainControlCV, tuneGrid = expand.grid(mtry = c(2)))
+rfFinal$results
+```
+
+Finally, we estimate out-of-sample error for rfBase and rfFinal.
+
+```{r cache = TRUE}
+predictBase <- predict(rfBase$finalModel, trainingReserve)
+matrixBase <- confusionMatrix(predictBase, trainingReserve$classe)
+predictFinal <- predict(rfFinal$finalModel, trainingReserve[, namesFinal])
+matrixFinal <- confusionMatrix(predictFinal, trainingReserve$classe)
+matrixBase
+matrixFinal
+```
+
+Note that accuracy of our prediction is higher for rfBase compared to rfFinal. Thus, we shall use rfBase with all 52 predictors to train on the validation dataset.
